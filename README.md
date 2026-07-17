@@ -9,7 +9,7 @@ API Jugaad is a core micro-service in the **Lynx** project. It launches a stealt
 | Provider | Website | Model | Status |
 |----------|---------|-------|--------|
 | **ChatGPT** | [chatgpt.com](https://chatgpt.com) | GPT-4o / GPT-4 | ✅ Stable |
-| **Z.ai** | [z.ai](https://z.ai) | GLM-5.2 (Zhipu) | ⚠️ Experimental |
+| **Z.ai** | [z.ai](https://z.ai) | GLM-5.2 (Zhipu) | ✅ Stable |
 | **Gemini** | [gemini.google.com](https://gemini.google.com) | Gemini Pro / Flash | ⚠️ Experimental |
 
 > **Note:** Z.ai and Gemini providers require you to inspect their web UIs and update the DOM selectors in `src/providers/zai.js` and `src/providers/gemini.js` respectively. See [Updating Selectors](#updating-selectors).
@@ -42,7 +42,8 @@ Client (Lynx Backend)
 
 1. On startup, a headless Chromium browser is launched with `puppeteer-extra` and the **stealth plugin** to avoid bot detection.
 2. The **provider factory** loads the correct provider module based on the `PROVIDER` env var.
-3. Provider-specific session cookies are injected, authenticating the browser as your logged-in user.
+3. Provider-specific session cookies are injected from `.env`, authenticating the browser as your logged-in user.
+   - **Auto-Login Feature:** If authentication fails (e.g. cookies are missing or expired), the Node server will automatically pause and launch the **Universal Login Helper** (a highly stealthy Python/Qt window). You simply log in manually, click "Save Cookies & Close", and the Node server automatically resumes, injects the new cookies, and starts the API!
 4. When a `POST /chat` request arrives, the provider navigates to a fresh chat, types the message, clicks send, waits for the streaming response to complete, and scrapes the assistant's reply from the DOM.
 5. A **mutex lock** ensures only one request is processed at a time (single browser tab).
 
@@ -113,32 +114,30 @@ Edit `.env` — set your provider and the corresponding session tokens:
 PROVIDER=chatgpt
 ```
 
-### 3. Get Session Tokens
+### 3. Get Session Tokens (Or use Auto-Login)
+
+**Method 1: Universal Auto-Login (Recommended)**
+The easiest way to get your session tokens is to simply run `npm start`. If you are not logged in, the server will automatically pop open a secure **Python QtWebEngine window**.
+1. Log into your provider normally in this window. (Google Sign-In is fully supported and unblocked here thanks to advanced stealth scripts).
+2. Click the green **Save Cookies & Close** button.
+3. The script will automatically dump all required cookies directly into your `.env` file and seamlessly restart the API!
+
+**Method 2: Manual Cookie Extraction**
+If you prefer to manually extract cookies from your normal browser's DevTools (`F12` → **Application** → **Cookies**):
 
 #### ChatGPT
-
-1. Open [chatgpt.com](https://chatgpt.com) in your browser and log in.
-2. Open DevTools (`F12`) → **Application** → **Cookies** → `https://chatgpt.com`.
-3. Copy `__Secure-next-auth.session-token.0` → paste as `SESSION_TOKEN_0`.
-4. Copy `__Secure-next-auth.session-token.1` → paste as `SESSION_TOKEN_1`.
+1. Copy `__Secure-next-auth.session-token.0` → paste as `SESSION_TOKEN_0`.
+2. Copy `__Secure-next-auth.session-token.1` → paste as `SESSION_TOKEN_1`.
 
 #### Z.ai
-
-1. Open [z.ai](https://z.ai) in your browser and log in.
-2. Open DevTools (`F12`) → **Application** → **Cookies** → `https://z.ai`.
-3. Copy the main session/auth cookie → paste as `ZAI_SESSION_COOKIE`.
-
-> **Note:** The exact cookie name may vary. Check `src/providers/zai.js` and update the cookie name in `getCookies()` if needed.
+1. Copy the main session/auth cookie (e.g. `acw_tc` or `oauth_id_token`) → paste as `ZAI_SESSION_COOKIE`. Or just use the Auto-Login feature which dumps the full cookie JSON array into `ZAI_COOKIES`.
 
 #### Gemini
+1. Copy `__Secure-1PSID` → paste as `GEMINI_PSID`.
+2. Copy `__Secure-1PSIDTS` → paste as `GEMINI_PSIDTS`.
+3. Copy `__Secure-1PSIDCC` → paste as `GEMINI_PSIDCC` (optional but recommended).
 
-1. Open [gemini.google.com](https://gemini.google.com) in your browser and log in.
-2. Open DevTools (`F12`) → **Application** → **Cookies** → `https://gemini.google.com`.
-3. Copy `__Secure-1PSID` → paste as `GEMINI_PSID`.
-4. Copy `__Secure-1PSIDTS` → paste as `GEMINI_PSIDTS`.
-5. Copy `__Secure-1PSIDCC` → paste as `GEMINI_PSIDCC` (optional but recommended).
-
-> **Note:** These tokens expire periodically. If the service throws an auth error, refresh them from your browser.
+> **Note:** These tokens expire periodically. If the service throws an auth error, the Python auto-login window will automatically pop up to help you refresh them!
 
 ### 4. Start the Server
 
@@ -356,12 +355,14 @@ The Z.ai and Gemini providers ship with **best-effort selectors** that may need 
 
 | Problem                            | Solution                                                                 |
 | ---------------------------------- | ------------------------------------------------------------------------ |
-| `Session token invalid or expired` | Refresh tokens from your browser (DevTools → Cookies) and restart        |
+| `Session token invalid or expired` | The Python auto-login window should open. If not, refresh tokens manually|
 | `Input box not found`              | The provider's UI may have changed — update selectors in `src/providers/` |
 | `Unknown provider "xyz"`           | Check `PROVIDER` in `.env` — must be one of: `chatgpt`, `zai`, `gemini` |
 | Chrome crashes in Docker           | Ensure `--shm-size=512m` is set; the default 64MB shared memory is insufficient |
 | `Server is busy` (429)             | Wait for the current request to complete; only one request at a time     |
-| CAPTCHA / bot detection            | Run with `headless: false` locally to solve manually, then switch back   |
+| `Failed to start: The browser is already running` | You have a lingering Puppeteer Chrome window open (or an old server is stuck in the background). Close all Chrome windows or run `taskkill /F /IM node.exe` to kill stuck servers. |
+| `Listen error: EADDRINUSE :::3000` | You started `npm start` multiple times without killing the first one. Run `taskkill /F /IM node.exe` and try again. |
+| CAPTCHA / bot detection            | Let the Python auto-login window handle it, or use `headless: false` locally to solve manually. |
 | Gemini blocks automation           | Google has aggressive anti-bot detection; try reducing request frequency  |
 
 ---

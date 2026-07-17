@@ -86,6 +86,23 @@ module.exports = {
     if (url.includes('login') || url.includes('sign-in') || url.includes('auth')) {
       throw new Error('Z.ai session cookie invalid or expired. Please refresh it from your browser.');
     }
+    
+    // Explicitly check for auth cookies because Z.ai has a chat box even when logged out
+    const cookies = await page.cookies();
+    const hasAuthCookie = cookies.some(c => c.name === 'acw_tc' || c.name === 'oauth_id_token' || c.name.includes('token') || c.name.includes('session'));
+    
+    if (!hasAuthCookie) {
+      // Check if there is a visible login button on the page as a fallback check
+      const hasLoginBtn = await page.evaluate(() => {
+        return Array.from(document.querySelectorAll('button, a')).some(el => 
+          el.textContent.toLowerCase().includes('log in') || 
+          el.textContent.toLowerCase().includes('sign in')
+        );
+      });
+      if (hasLoginBtn || cookies.length < 3) {
+        throw new Error('Not logged in. Missing Z.ai auth cookies.');
+      }
+    }
 
     // Wait for the input box to confirm we're on the chat page
     try {

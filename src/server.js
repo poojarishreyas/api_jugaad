@@ -158,9 +158,62 @@ app.get('/status', (req, res) => {
   res.json({ status: 'ok', busy: isBusy(), provider: getProviderName() });
 });
 
+// ── Interactive provider selection ──────────────────────────────────────
+const readline = require('readline');
+
+function askProvider() {
+  return new Promise((resolve) => {
+    const providers = ['chatgpt', 'zai', 'gemini'];
+    const envDefault = config.provider || 'chatgpt';
+
+    console.log('\n╔══════════════════════════════════════╗');
+    console.log('║       🤖 API Jugaad — Select AI      ║');
+    console.log('╠══════════════════════════════════════╣');
+    providers.forEach((p, i) => {
+      const marker = p === envDefault ? ' ← default' : '';
+      console.log(`║  ${i + 1}. ${p.padEnd(12)}${marker.padEnd(21)}║`);
+    });
+    console.log('╚══════════════════════════════════════╝');
+
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    rl.question(`\nChoose provider [1-${providers.length}] (Enter for ${envDefault}): `, (answer) => {
+      rl.close();
+      const trimmed = answer.trim();
+
+      if (!trimmed) {
+        console.log(`[server] Using default provider: ${envDefault}`);
+        resolve(envDefault);
+        return;
+      }
+
+      const num = parseInt(trimmed, 10);
+      if (num >= 1 && num <= providers.length) {
+        console.log(`[server] Selected provider: ${providers[num - 1]}`);
+        resolve(providers[num - 1]);
+        return;
+      }
+
+      // Allow typing the name directly
+      const byName = trimmed.toLowerCase();
+      if (providers.includes(byName)) {
+        console.log(`[server] Selected provider: ${byName}`);
+        resolve(byName);
+        return;
+      }
+
+      console.log(`[server] Invalid choice "${trimmed}", using default: ${envDefault}`);
+      resolve(envDefault);
+    });
+  });
+}
+
 // Boot
 (async () => {
   try {
+    // Ask user which AI to use before launching the browser
+    const chosenProvider = await askProvider();
+    config.provider = chosenProvider;
+
     const provider = await initBrowser();
     setProvider(provider);
     const server = app.listen(config.port, () => {
