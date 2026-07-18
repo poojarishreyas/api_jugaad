@@ -2,7 +2,7 @@
 
 A local API server that turns **ChatGPT, Google Gemini, and Z.ai** into a real API — no paid subscription, no API keys from the provider. Just log in once in the browser window and start making requests.
 
-Supports **OpenAI-compatible**, **Anthropic-compatible**, and a simple `/chat` endpoint — including full **streaming** (SSE), so tools like **Claude Code**, **Continue**, and **Open WebUI** work out of the box.
+Supports **OpenAI-compatible**, **Anthropic Messages-compatible**, and a simple `/chat` endpoint. Its Anthropic adapter understands Claude Code's structured messages, tool loop, and SSE protocol.
 
 ---
 
@@ -60,7 +60,7 @@ curl http://localhost:3000/status
 ---
 
 ### `GET /v1/models`
-Lists available model (your active provider). Needed by Claude Code, Continue, Open WebUI.
+Lists Claude-shaped model IDs for gateway model discovery.
 ```bash
 curl http://localhost:3000/v1/models
 ```
@@ -94,7 +94,7 @@ curl -X POST http://localhost:3000/v1/chat/completions \
 ---
 
 ### `POST /v1/messages` — Anthropic-compatible
-Works with the Anthropic SDK and Claude Code. Supports `stream: true`, `system` prompt, and multi-turn messages.
+Supports Claude Code's `system` blocks, message history, tool definitions, `tool_use` / `tool_result` turns, adaptive-thinking fields, and `stream: true` SSE.
 ```bash
 curl -X POST http://localhost:3000/v1/messages \
   -H "Content-Type: application/json" \
@@ -127,6 +127,20 @@ ANTHROPIC_API_KEY=your-api-key \
 claude
 ```
 
+`ANTHROPIC_AUTH_TOKEN` also works if that is how your Claude Code setup authenticates. API Jugaad accepts both `Authorization: Bearer …` and `x-api-key`.
+
+### What compatibility means here
+
+Claude Code sends an Anthropic **Messages API** request, not a simple chat prompt. API Jugaad now translates its system blocks, conversation history, tool schemas, and tool results into the browser prompt. When the browser model chooses a tool, it is returned to Claude Code as a real Anthropic `tool_use` block; Claude Code executes it locally and sends the `tool_result` in the next request.
+
+The browser websites do not expose their token stream to Playwright, so text is still scraped after the provider finishes generating. The server starts the SSE response immediately and sends heartbeats while it waits, which prevents Claude Code from treating the request as stalled, but it cannot match the first-token latency of a native Claude API.
+
+### Additional Claude Code gateway routes
+
+- `HEAD /` — safe gateway startup probe.
+- `POST /v1/messages/count_tokens` — consistent local token estimate for context management.
+- Anthropic-shaped error bodies and a `request-id` response header.
+
 ---
 
 ## API Key Auth
@@ -141,6 +155,19 @@ curl -H "Authorization: Bearer your-key" ...
 # Header (legacy)
 curl -H "x-api-key: your-key" ...
 ```
+
+## Capturing requests and responses
+
+To save every AI request and response, add this to `.env` and restart the server:
+
+```env
+CAPTURE_RAW_REQUESTS=true
+CAPTURE_DIRECTORY=captures
+```
+
+This creates one file per `/chat`, `/v1/chat/completions`, or `/v1/messages` request: `captures/000001.json`, `captures/000002.json`, and so on. Each file contains the raw API request (`request`), the translated browser prompt (`processed_request`), the raw browser response, and the final API response (or an error), so prompt 1 and response 1 stay together. If an SSE client disconnects early, its file is marked with an error instead of being left incomplete. `raw_request.json` still contains the newest request as a quick shortcut.
+
+Captures include your conversation, system prompt, and tool definitions. They are gitignored and disabled by default; turn them off again after debugging.
 
 ---
 
@@ -165,7 +192,7 @@ Invoke-RestMethod -Uri "http://localhost:3000/v1/messages" `
   -Body '{"model":"claude-3-5-sonnet-20241022","max_tokens":100,"messages":[{"role":"user","content":"say hi in 5 words"}]}'
 ```
 
-**4. Streaming (exactly what Claude Code sends):**
+**4. Streaming (the Messages SSE protocol Claude Code uses):**
 ```powershell
 $body = '{"model":"claude-3-5-sonnet-20241022","max_tokens":100,"stream":true,"messages":[{"role":"user","content":"say hi in 5 words"}]}'
 $req = [System.Net.HttpWebRequest]::Create("http://localhost:3000/v1/messages")
@@ -174,6 +201,13 @@ $bytes = [System.Text.Encoding]::UTF8.GetBytes($body)
 $req.GetRequestStream().Write($bytes, 0, $bytes.Length)
 $reader = New-Object System.IO.StreamReader($req.GetResponse().GetResponseStream())
 while (-not $reader.EndOfStream) { Write-Host $reader.ReadLine() }
+```
+
+**5. Token-count compatibility:**
+```bash
+curl -X POST http://localhost:3000/v1/messages/count_tokens \
+  -H "Content-Type: application/json" \
+  -d '{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"Hello"}]}'
 ```
 
 ---

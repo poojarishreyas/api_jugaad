@@ -1,2 +1,8 @@
 node_modules
 .env
+venv
+.venv
+chrome-data
+raw_request.json
+*.request.json
+captures

@@ -4,5 +4,9 @@ cookies.json
 chrome-data/
 backcommit.py
 venv/
+.venv/
 __pycache__/
 *.pyc
+raw_request.json
+*.request.json
+captures/

@@ -17,11 +17,8 @@ def get_provider_name() -> str:
 async def send_message(message: str) -> str:
     """
     Sends a message and returns the response.
-    Blocks until completion. Thread-safe using asyncio lock.
+    Queues requests until the single browser session is available.
     """
-    if _lock.locked():
-        raise Exception("A request is already in progress. Try again shortly.")
-        
     async with _lock:
         if not _provider:
             raise Exception("Provider not initialized.")
