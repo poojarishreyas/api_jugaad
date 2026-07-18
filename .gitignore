@@ -3,3 +3,6 @@ node_modules/
 cookies.json
 chrome-data/
 backcommit.py
+venv/
+__pycache__/
+*.pyc
