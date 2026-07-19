@@ -1,6 +1,6 @@
 # Reverse Engineering Claude Code: A Deep Technical Autopsy of the World's Most Sophisticated AI CLI
 
-*By Shreyas Kulkarni — Field Reverse Engineering Report, July 2026*
+*By Shreyas poojari — Field Reverse Engineering Report, July 2026*
 
 ---
 
@@ -10,9 +10,24 @@
 
 ## The Setup: How You Catch a Ghost in Transit
 
-Claude Code is Anthropic's official CLI. It presents itself as a clean REPL in your terminal, but beneath that minimal exterior runs an elaborate orchestration engine that talks to the Anthropic Messages API on `/v1/messages`. To see what was being said, I built **api_jugaad** — a local Python proxy running on Flask. I pointed Claude Code's `ANTHROPIC_BASE_URL` at my proxy (`http://localhost:11434`), instrumented it to capture every request/response pair as a numbered JSON file, then relayed them to the actual upstream (or to a browser-automated model). I captured **91 consecutive API calls** from a single Claude Code session where the CLI was asked to build a Todo application.
+Claude Code is Anthropic's official CLI. It presents itself as a clean REPL in your terminal, but beneath that minimal exterior runs an elaborate orchestration engine that talks to the Anthropic Messages API on `/v1/messages`. To see what was being said, I built **api_jugaad** — a custom local Python proxy. I pointed Claude Code's `ANTHROPIC_BASE_URL` at my proxy (`http://localhost:3000`), instrumented it to capture every request/response pair as a numbered JSON file, and then seamlessly relayed the traffic to my own inference backend. I captured **96 consecutive API calls** from Claude Code sessions where the CLI was asked to build a Todo application.
 
 What I found was not a simple chatbot making API calls. What I found was a fully-featured **agentic operating system** communicating via a meticulously structured protocol.
+
+### The Intercept: Engineering the `api_jugaad` Proxy
+
+To pull this off without modifying or patching Claude Code's binaries, I exploited a standard environment variable override intended for enterprise proxies. By setting `ANTHROPIC_BASE_URL=http://localhost:3000`, I forced Claude Code to send all of its proprietary Messages API traffic directly into my local Flask server.
+
+But I didn't just want to passively log the traffic—I needed the CLI to fully function while I intercepted the orchestration. 
+
+This required building a real-time protocol bridge. `api_jugaad` acts as a **transparent man-in-the-middle interception layer**:
+1. **Ingest:** It receives Anthropic-formatted JSON from Claude Code.
+2. **Inspect & Record:** It captures the full request payload, including the massive system prompts, tool schemas, and metadata fingerprints, dumping them to disk for offline analysis.
+3. **Execute:** It relays the request to my custom API backend to execute the model inference.
+4. **Reconstruct:** It parses the backend's response and reconstructs it into a perfect Anthropic `tool_use` JSON block.
+5. **Stream:** Finally, it streams the response back to Claude Code via Server-Sent Events (SSE).
+
+Claude Code thinks it's talking directly to Anthropic's flagship `claude-opus-4-8` model over a secure API. In reality, it's talking to a local Python script running on loopback. This interception architecture gave me a pristine, unencrypted view of every single byte the CLI uses to manage its autonomous agents.
 
 ---
 
@@ -193,7 +208,9 @@ Claude Code ships with a **built-in tool registry** that is transmitted as the `
 | `mcp__ide__executeCode` | Execute Python in the Jupyter kernel of the open notebook |
 | `mcp__ide__getDiagnostics` | Get LSP diagnostics from VS Code |
 
-**Total: 30 distinct tools** across 8 functional categories.
+**Total: 33 distinct tools** across 8 functional categories.
+
+> **New session update:** A second capture session (5 new captures, July 2026) confirmed the tool count at **33** — three more than initially documented. The three additional tools verified in the new session are `mcp__ide__executeCode`, `mcp__ide__getDiagnostics` (already listed above), and the re-confirmed `TaskOutput` (deprecated but still transmitted). No new tools appeared, confirming this is the stable production registry.
 
 ---
 
@@ -218,6 +235,8 @@ Three fields are tracked:
 3. **`session_id`** — A fresh UUID4 for each Claude Code session. This groups all API calls within a single invocation of the CLI together for billing and analytics.
 
 > **Key insight:** Claude Code sends **telemetry-grade identity data** in every request, even without a logged-in account. The device fingerprint is the primary attribution vector for free usage.
+
+> **New finding — `session_id` rotates between sessions, not within them:** Across the fresh 5-capture session, all 5 requests shared the same `session_id: b448a7f4-60e9-4948-88a2-6c7e1726f660` — confirming it is a per-CLI-invocation UUID. The previous session had a different `session_id`. The `device_id` was identical across both sessions, confirming it is the stable machine fingerprint.
 
 ---
 
@@ -352,20 +371,87 @@ You are STRICTLY PROHIBITED from:
 
 This is **principle of least privilege** applied to AI agents. The parent agent decides the scope. The child agent is constrained to that scope at the protocol level, not just by instruction.
 
+### 5.4 The Three Hidden `system` Message Injections Inside `messages[]`
+
+A second capture session revealed that Claude Code uses **not one but three distinct flavours** of mid-conversation `role:"system"` messages injected into the `messages` array — each serving a different purpose:
+
+**Type A — `<system-reminder>` (injected into user content block)**
+
+The very first user message always contains a hidden text block prepended before the actual user text:
+
+```json
+{
+  "role": "user",
+  "content": [
+    {
+      "type": "text",
+      "text": "<system-reminder>\nAs you answer the user's questions, you can use the following context:\n# currentDate\nToday's date is 2026-07-19.\n\nIMPORTANT: this context may or may not be relevant to your tasks.\n</system-reminder>"
+    },
+    {
+      "type": "text",
+      "text": "build a calculator using html,css,js"  ← actual user input
+    }
+  ]
+}
+```
+
+This is a **date injection** disguised as a user content block — not a `system` role, not the top-level `system` array. The `<system-reminder>` tag is how Claude Code tells the model today's date without burning a system prompt cache slot. The explicit warning *"this context may or may not be relevant — do not respond to it unless highly relevant"* prevents the model from wasting its response acknowledging the date.
+
+**Type B — Agent catalog (dynamic, mid-array)**
+
+The `role:"system"` message containing the available agent types listing (seen in Part 1). Confirmed still transmitted this way.
+
+**Type C — File-change notification (injected after tool results)**
+
+When the user edits a file that the model wrote (e.g., reformatting `index.html`), Claude Code automatically injects a new `role:"system"` message into the conversation *after* the tool results:
+
+```
+Note: /home/shreyas/Pictures/api_jugaad/myapp/index.html was modified,
+either by the user or by a linter. This change was intentional, so make
+sure to take it into account as you proceed (ie. don't revert it unless
+the user asks you to). Don't tell the user this, since they are already
+aware. Here are the relevant changes (shown with line numbers):
+1   <!DOCTYPE html>\n<html lang="en">\n...
+```
+
+This is the **filesystem watcher system** — Claude Code monitors the files it writes and, when an external modification is detected, silently tells the model about it via a mid-conversation system injection. The instruction *"Don't tell the user this, since they are already aware"* prevents the model from narrating an event the user caused themselves.
+
+### 5.5 The "User Stepped Away" Recap Trigger
+
+Capture 000005 from the new session reveals a completely undocumented background trigger. When the user leaves and returns to the terminal, Claude Code sends a **synthetic message as if from the user**:
+
+```
+The user stepped away and is coming back. Recap in under 40 words, 1-2 plain 
+sentences, no markdown. Lead with the overall goal and current task, then the 
+one next action. Skip root-cause narrative, fix internals, secondary to-dos, 
+and em-dash tangents.
+```
+
+The model's response (which appeared in the Claude Code terminal as the idle recap):
+
+```
+The goal is to build a calculator web app, and the HTML, CSS, and JavaScript 
+files have been created. Next, open the project in a browser to verify the 
+calculator renders and functions correctly.
+```
+
+This is **session continuity UX automation**: Claude Code detects the user returning (likely via terminal focus events or an inactivity timeout), fires a background API call to get a fresh context summary, and displays it as a "what we were doing" reminder. The strict format constraints (40 words, no markdown, lead with goal) are enforced via prompt, not via JSON schema — the model is trusted to comply without structured output.
+
 ---
 
 ## Part 6: The Version Fingerprint — Tracking Claude Code Builds
 
-Across the 91 captures, the `cc_version` in the billing header changed **multiple times within the same session**:
+Across both capture sessions, the `cc_version` in the billing header tracks the exact build:
 
-| Capture | `cc_version` |
-|---------|-------------|
-| 000001 | `2.1.215.bf2` |
-| 000002 | `2.1.215.b3f` |
-| 000012 | `2.1.215.3a2` |
-| 000017 | `2.1.215.a49` |
+| Capture | Session | `cc_version` |
+|---------|---------|-------------|
+| 000001 | Session 1 | `2.1.215.bf2` |
+| 000002 | Session 1 | `2.1.215.b3f` |
+| 000012 | Session 1 | `2.1.215.3a2` |
+| 000017 | Session 1 | `2.1.215.a49` |
+| 000001–000005 | Session 2 | `2.1.215.d16` (title call: `2.1.215.5d4`) |
 
-These appear to be **short git commit hashes** (7-hex-char abbreviated SHA) for the specific Claude Code build that processed each request. Different requests within the same session having different version strings suggests that different components (main agent, background workers, sub-agents) run from **different versioned bundles** — possibly indicating a microservices architecture inside Claude Code itself.
+The title generator in Session 2 used `2.1.215.5d4` while all other requests used `2.1.215.d16` — confirming that background workers run **different code bundles** than the main agent even within the same session.
 
 **You can passively track Claude Code's internal build deployment in real-time by monitoring this field.**
 
@@ -517,9 +603,22 @@ After analyzing 91 API captures, the picture that emerges is not of a chatbot wr
 
 The sophistication of this system is significantly beyond what its simple terminal UI suggests. Claude Code is, at its API layer, one of the most carefully engineered AI runtime systems publicly deployed — and now, its full architecture is documented here.
 
+### New Findings Summary (Second Session)
+
+The fresh 5-capture session added these discoveries not present in the initial 91-capture analysis:
+
+| # | Finding | Capture |
+|---|---------|--------|
+| 1 | `session_id` is per-CLI-invocation; `device_id` is stable across sessions | 000001–000005 |
+| 2 | Three distinct `role:"system"` injection types in `messages[]` | 000002, 000003, 000005 |
+| 3 | `<system-reminder>` date injection hidden inside user content blocks | 000002 |
+| 4 | File-change watcher injects silent system message after external edits | 000004 |
+| 5 | "User stepped away" recap is a synthetic background API call | 000005 |
+| 6 | Tool count confirmed at **33** (not 30 as initially reported) | 000002 |
+
 ---
 
-*This article is based on 91 live API captures from a Claude Code session on July 19, 2026.*  
+*This article is based on 96 live API captures across two Claude Code sessions on July 19, 2026.*  
 *The capture infrastructure is the open-source `api_jugaad` project.*  
-*Claude Code version at time of capture: `2.1.215.bf2` through `2.1.215.a49`*  
+*Claude Code version at time of capture: `2.1.215.bf2` through `2.1.215.d16`*  
 *Model: `claude-opus-4-8[1m]` (Opus 4.8, 1M context)*

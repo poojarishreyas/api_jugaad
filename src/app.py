@@ -20,6 +20,7 @@ from .anthropic import (
     AnthropicAPIError,
     build_browser_prompt,
     estimate_tokens,
+    extract_working_directory,
     message_payload,
     parse_browser_response,
     stream_message,
@@ -244,6 +245,7 @@ async def anthropic_messages(request: Request):
     if not isinstance(model, str):
         raise AnthropicAPIError(400, "invalid_request_error", "'model' must be a string")
     input_tokens = estimate_tokens(prompt)
+    working_directory = extract_working_directory(body)
     capture = await start_exchange_capture(body, "/v1/messages", prompt)
 
     if body.get("stream"):
@@ -265,6 +267,7 @@ async def anthropic_messages(request: Request):
             stream_message(
                 prompt=prompt, model=model, input_tokens=input_tokens,
                 tools=body.get("tools"), send_message=chat.send_message,
+                working_directory=working_directory,
                 on_complete=capture_complete, on_error=capture_error,
             ),
             media_type="text/event-stream",
@@ -277,7 +280,7 @@ async def anthropic_messages(request: Request):
         if capture:
             await asyncio.to_thread(capture.fail, str(exc))
         raise AnthropicAPIError(500, "api_error", str(exc))
-    result = parse_browser_response(response_text, body.get("tools"))
+    result = parse_browser_response(response_text, body.get("tools"), working_directory)
     response = message_payload(result, model, input_tokens)
     if capture:
         await asyncio.to_thread(capture.complete, browser_response=response_text, api_response=response)

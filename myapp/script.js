@@ -1,0 +1,1 @@
+const display=document.getElementById('display');function append(v){display.value+=v}function clearDisplay(){display.value=''}function del(){display.value=display.value.slice(0,-1)}function calculate(){try{display.value=Function('return '+display.value)()}catch(e){display.value='Error'}}

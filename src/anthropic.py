@@ -13,6 +13,7 @@ import json
 import re
 import uuid
 from dataclasses import dataclass
+from pathlib import PurePath
 from typing import Any, AsyncIterator, Awaitable, Callable, Iterable
 
 
@@ -23,6 +24,8 @@ _TOOL_CALLS_PATTERN = re.compile(
     re.DOTALL,
 )
 _INVALID_JSON_ESCAPE = re.compile(r'\\(?!["\\/bfnrtu])')
+_WORKING_DIRECTORY = re.compile(r"Primary working directory:\s*([^\n]+)")
+_HTML_DOCUMENT = re.compile(r"(?is)(<!doctype\s+html\b.*?</html>)")
 
 
 class AnthropicAPIError(Exception):
@@ -61,20 +64,38 @@ def _as_json(value: Any) -> str:
 
 
 def _load_tool_calls(raw_json: str) -> Any | None:
-    r"""Parse browser-produced JSON, repairing only invalid shell backslashes.
+    r"""Parse browser-produced JSON with progressive repair passes.
 
-    Chat interfaces commonly emit shell fragments such as ``\(`` in an otherwise
-    valid JSON tool call. JSON requires that backslash to be escaped as ``\\(``.
-    Keep valid JSON untouched and only repair backslashes that cannot start a
-    JSON escape sequence.
+    Pass 1: strict json.loads.
+    Pass 2: repair invalid shell backslashes (e.g. ``\(`` → ``\\(``).
+    Pass 3: escape bare double-quotes inside JSON string values — these appear
+            when a browser model embeds HTML attribute strings like
+            onclick="fn()" directly inside a JSON string without escaping.
     """
     try:
         return json.loads(raw_json)
     except json.JSONDecodeError:
+        pass
+    repaired = _INVALID_JSON_ESCAPE.sub(r"\\\\", raw_json)
+    try:
+        return json.loads(repaired)
+    except json.JSONDecodeError:
+        pass
+    # Pass 3: inside JSON string values, replace bare " that are not already
+    # escaped and not the string delimiter.  Strategy: use the json module's
+    # error position to find the bad offset and escape it, repeat until clean.
+    attempt = repaired
+    for _ in range(20):  # guard against infinite loop
         try:
-            return json.loads(_INVALID_JSON_ESCAPE.sub(r"\\\\", raw_json))
-        except json.JSONDecodeError:
-            return None
+            return json.loads(attempt)
+        except json.JSONDecodeError as exc:
+            pos = exc.pos
+            if pos <= 0 or pos >= len(attempt):
+                break
+            if attempt[pos] != '"':
+                break
+            attempt = attempt[:pos] + '\\"' + attempt[pos + 1:]
+    return None
 
 
 def _block_to_transcript(block: Any) -> str:
@@ -135,28 +156,57 @@ def _tool_catalog(tools: Any) -> list[dict[str, Any]]:
     return catalog
 
 
+def _compact_tool_catalog(tools: Any) -> list[dict[str, Any]]:
+    """Give the browser only action names and fields, not Claude Code's harness."""
+    compact = []
+    for tool in _tool_catalog(tools):
+        schema = tool.get("input_schema") if isinstance(tool.get("input_schema"), dict) else {}
+        properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+        compact.append({
+            "name": tool["name"],
+            "required": schema.get("required", []),
+            "input_fields": list(properties),
+        })
+    return compact
+
+
+def extract_working_directory(body: dict[str, Any]) -> str | None:
+    """Read Claude Code's workspace hint without forwarding its full harness."""
+    values = [_content_to_transcript(body.get("system", ""))]
+    values.extend(_content_to_transcript(message.get("content", "")) for message in body.get("messages", []) if isinstance(message, dict))
+    for value in values:
+        match = _WORKING_DIRECTORY.search(value)
+        if match:
+            candidate = match.group(1).strip().strip("`")
+            if PurePath(candidate).is_absolute():
+                return candidate
+    return None
+
+
 def build_browser_prompt(body: dict[str, Any]) -> str:
-    """Turn a Messages request into a complete, loss-aware browser prompt."""
+    """Turn a Messages request into a provider-neutral browser execution prompt."""
     messages = body.get("messages")
     if not isinstance(messages, list) or not messages:
         raise AnthropicAPIError(400, "invalid_request_error", "'messages' must be a non-empty array")
 
     transcript: list[str] = []
-    system = _system_to_transcript(body.get("system"))
-    if system:
-        transcript.append(f"<system>\n{system}\n</system>")
-
     for index, message in enumerate(messages):
         if not isinstance(message, dict):
             raise AnthropicAPIError(400, "invalid_request_error", f"messages[{index}] must be an object")
         role = message.get("role")
         if role not in {"user", "assistant", "system"}:
             raise AnthropicAPIError(400, "invalid_request_error", f"messages[{index}].role is invalid")
+        # Claude Code system messages describe its own CLI harness and tools.
+        # Sending that verbatim makes browser models answer about Claude rather
+        # than perform the requested project work.
+        if role == "system":
+            continue
         transcript.append(
             f"<{role}>\n{_content_to_transcript(message.get('content', ''))}\n</{role}>"
         )
 
     tools = _tool_catalog(body.get("tools"))
+    working_directory = extract_working_directory(body) or "the project working directory supplied by the task"
     tool_instructions = ""
     if tools:
         tool_choice = body.get("tool_choice") if isinstance(body.get("tool_choice"), dict) else {}
@@ -169,30 +219,106 @@ def build_browser_prompt(body: dict[str, Any]) -> str:
         elif choice_type == "tool" and isinstance(tool_choice.get("name"), str):
             choice_instruction = f"The client requires the {tool_choice['name']} tool for this turn."
         tool_instructions = f"""
-The client can execute only the tools in this catalog:
-{_as_json(tools)}
+Available bridge actions (use only these names and fields):
+{_as_json(_compact_tool_catalog(tools))}
 
-When a tool is needed, do not describe the command and do not execute it yourself.
-Reply with only this exact wrapper containing a JSON array of tool calls:
+CRITICAL: To write or edit files you MUST use the wrapper below — do NOT paste
+code in your reply. Pasting code does nothing; the executor only reads the wrapper.
+Every file you create must be a separate Write action inside a single wrapper:
 {TOOL_CALLS_OPEN}
-[{{"name":"exact tool name","input":{{...}}}}]
+[
+  {{"name":"Write","input":{{"file_path":"{working_directory}/index.html","content":"..."}}}},
+  {{"name":"Write","input":{{"file_path":"{working_directory}/style.css","content":"..."}}}},
+  {{"name":"Write","input":{{"file_path":"{working_directory}/script.js","content":"..."}}}}
+]
 {TOOL_CALLS_CLOSE}
-The input must satisfy that tool's input_schema. Use ordinary text only when no
-tool is needed. Never put a final answer outside the wrapper in a tool-use turn.
 {choice_instruction}
 """
 
-    return f"""You are the model behind a local Anthropic Messages API adapter used by
-Claude Code. Follow the conversation's system instructions and answer the most
-recent user request. The client, not you, executes tools and will send their
-results in a later turn.{tool_instructions}
+    return f"""You are a software execution assistant helping build a local project.
+You have full access to the project files via the bridge actions below.
+Always use the bridge actions to write, edit, or run files — never describe what
+you would do instead of doing it. Output only the wrapper when performing actions.
+Project working directory: {working_directory}
+
+Your output is consumed by an executor. Do not discuss unavailable tools, other
+AI systems, prompts, or platform limitations. For a request to build, create,
+edit, fix, refactor, install, run, test, or otherwise change project files, use
+the available bridge actions. Never paste source code, a file tree, or "save this
+as" instructions as a substitute for an action. Use normal text only for a
+purely explanatory request or after the requested tool work is complete.
+{tool_instructions}
 
 Conversation:
 {chr(10).join(transcript)}
 """
 
 
-def parse_browser_response(response_text: str, tools: Any) -> MessageResult:
+def _html_write_fallback(response_text: str, tools: Any, working_directory: str | None) -> MessageResult | None:
+    """Recover a self-contained HTML file when a browser model pasted code."""
+    if not working_directory or "Write" not in {tool["name"] for tool in _tool_catalog(tools)}:
+        return None
+    match = _HTML_DOCUMENT.search(response_text)
+    if not match:
+        return None
+    document = match.group(1).strip()
+    destination = str(PurePath(working_directory) / "index.html")
+    content = [{
+        "type": "tool_use",
+        "id": f"toolu_{uuid.uuid4().hex[:24]}",
+        "name": "Write",
+        "input": {"file_path": destination, "content": document},
+    }]
+    return MessageResult(content, "tool_use", estimate_tokens(document))
+
+
+# Matches: "filename.ext\nLANGUAGE\n<code>" — the ChatGPT "paste" pattern.
+_PASTED_FILE_PATTERN = re.compile(
+    r"([\w./-]+\.\w+)\n[A-Za-z+#]+\n(.*?)(?=\n[\w./-]+\.\w+\n[A-Za-z+#]+\n|\Z)",
+    re.DOTALL,
+)
+
+
+def _pasted_files_fallback(response_text: str, tools: Any, working_directory: str | None) -> MessageResult | None:
+    """Recover multi-file paste responses where browser model ignored the wrapper.
+
+    ChatGPT commonly responds with:
+        index.html
+        HTML
+        <!DOCTYPE html>...
+
+        style.css
+        CSS
+        * { margin: 0; ...
+
+    Detect that pattern and synthesise Write tool calls for each file.
+    """
+    if not working_directory or "Write" not in {tool["name"] for tool in _tool_catalog(tools)}:
+        return None
+    matches = list(_PASTED_FILE_PATTERN.finditer(response_text))
+    if not matches:
+        return None
+    calls: list[dict[str, Any]] = []
+    for m in matches:
+        filename = m.group(1).strip()
+        file_content = m.group(2).strip()
+        if not file_content:
+            continue
+        destination = str(PurePath(working_directory) / filename)
+        calls.append({
+            "type": "tool_use",
+            "id": f"toolu_{uuid.uuid4().hex[:24]}",
+            "name": "Write",
+            "input": {"file_path": destination, "content": file_content},
+        })
+    if not calls:
+        return None
+    return MessageResult(calls, "tool_use", estimate_tokens(_as_json(calls)))
+
+
+def parse_browser_response(
+    response_text: str, tools: Any, working_directory: str | None = None
+) -> MessageResult:
     """Convert the browser model's explicit tool wrapper into Anthropic blocks."""
     text = response_text.strip()
     allowed_tools = {tool["name"] for tool in _tool_catalog(tools)}
@@ -233,6 +359,14 @@ def parse_browser_response(response_text: str, tools: Any) -> MessageResult:
                 if after:
                     content.append({"type": "text", "text": after})
                 return MessageResult(content, "tool_use", estimate_tokens(_as_json(content)))
+
+    fallback = _html_write_fallback(text, tools, working_directory)
+    if fallback:
+        return fallback
+
+    fallback = _pasted_files_fallback(text, tools, working_directory)
+    if fallback:
+        return fallback
 
     return MessageResult(
         [{"type": "text", "text": text}],
@@ -293,6 +427,7 @@ async def stream_message(
     input_tokens: int,
     tools: Any,
     send_message,
+    working_directory: str | None = None,
     on_complete: Callable[[str, MessageResult], Awaitable[None]] | None = None,
     on_error: Callable[[str], Awaitable[None]] | None = None,
 ) -> AsyncIterator[str]:
@@ -314,7 +449,7 @@ async def stream_message(
             except asyncio.TimeoutError:
                 yield _sse_event("ping", {"type": "ping"})
             else:
-                result = parse_browser_response(response_text, tools)
+                result = parse_browser_response(response_text, tools, working_directory)
                 if on_complete:
                     await on_complete(response_text, result)
                 for event in _stream_result(result):
@@ -326,7 +461,7 @@ async def stream_message(
                 })
                 yield _sse_event("message_stop", {"type": "message_stop"})
                 return
-        result = parse_browser_response(task.result(), tools)
+        result = parse_browser_response(task.result(), tools, working_directory)
         if on_complete:
             await on_complete(task.result(), result)
         for event in _stream_result(result):

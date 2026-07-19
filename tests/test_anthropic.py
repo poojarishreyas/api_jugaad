@@ -27,7 +27,7 @@ TOOLS = [{
 
 
 class AnthropicTranslationTests(unittest.TestCase):
-    def test_preserves_system_tool_history_and_tool_catalog(self):
+    def test_preserves_tool_history_without_forwarding_cli_harness(self):
         prompt = build_browser_prompt({
             "system": [{"type": "text", "text": "You are a coding agent."}],
             "tools": TOOLS,
@@ -41,11 +41,31 @@ class AnthropicTranslationTests(unittest.TestCase):
             ],
         })
 
-        self.assertIn("You are a coding agent.", prompt)
+        self.assertNotIn("You are a coding agent.", prompt)
+        self.assertIn("You are an execution planner", prompt)
         self.assertIn("tool_use id=toolu_old name=Bash", prompt)
         self.assertIn("tool_result tool_use_id=toolu_old", prompt)
         self.assertIn('"name":"Bash"', prompt)
         self.assertIn(TOOL_CALLS_OPEN, prompt)
+        self.assertIn("Available bridge actions", prompt)
+        self.assertIn("Never paste source code", prompt)
+
+    def test_recovers_self_contained_html_as_a_write_call(self):
+        tools = TOOLS + [{
+            "name": "Write",
+            "input_schema": {
+                "type": "object",
+                "properties": {"file_path": {"type": "string"}, "content": {"type": "string"}},
+                "required": ["file_path", "content"],
+            },
+        }]
+        response = "Here is the implementation:\n<!DOCTYPE html><html><body>Calculator</body></html>"
+        result = parse_browser_response(response, tools, "/workspace/calculator")
+
+        self.assertEqual(result.stop_reason, "tool_use")
+        self.assertEqual(result.content[0]["name"], "Write")
+        self.assertEqual(result.content[0]["input"]["file_path"], "/workspace/calculator/index.html")
+        self.assertEqual(result.content[0]["input"]["content"], "<!DOCTYPE html><html><body>Calculator</body></html>")
 
     def test_converts_explicit_tool_wrapper_to_tool_use_block(self):
         response = f"{TOOL_CALLS_OPEN}\n[{{\"name\":\"Bash\",\"input\":{{\"command\":\"pwd\"}}}}]\n{TOOL_CALLS_CLOSE}"
